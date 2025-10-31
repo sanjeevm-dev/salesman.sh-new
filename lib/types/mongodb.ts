@@ -62,6 +62,12 @@ export interface SessionLog {
   reasoning: string | null;
   output: unknown;
   screenshotUrl?: string | null;  // Optional screenshot URL
+  extractedData?: {
+    dataType: string;
+    records: Array<Record<string, unknown>>;
+    totalCount: number;
+    extractedAt: string;
+  } | null;
   createdAt: string;  // Serialized as string from API
 }
 

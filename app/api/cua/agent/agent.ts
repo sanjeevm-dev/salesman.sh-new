@@ -16,6 +16,7 @@ import axios from "axios";
 import axiosRetry from 'axios-retry';
 import { sessionStateManager } from "./session_state";
 import { StallGuard } from "./stall_guard";
+import { extractionEnabled } from "../../../lib/feature-flags";
 
 type AcknowledgeSafetyCheckCallback = (message: string) => boolean;
 
@@ -122,6 +123,42 @@ export class Agent {
         strict: false,
       },
     ];
+    // Add extraction tool as optional function tool (feature-flagged)
+    if (extractionEnabled()) {
+      this.tools.push({
+        type: "function",
+        name: "extract_data",
+        description: "Extract structured data from the current page using structured selectors or smart mode.",
+        parameters: {
+          type: "object",
+          properties: {
+            config: {
+              type: "object",
+              properties: {
+                mode: { type: "string", enum: ["structured", "smart"] },
+                dataType: { type: "string" },
+                selectors: {
+                  type: "object",
+                  properties: {
+                    container: { type: "string" },
+                    fields: { type: "object", additionalProperties: { type: "string" } },
+                  },
+                },
+                keywords: { type: "array", items: { type: "string" } },
+                maxRecords: { type: "number" },
+                validate: { type: "boolean" },
+                save: { type: "boolean" },
+              },
+              required: ["mode", "dataType"],
+              additionalProperties: false,
+            },
+          },
+          required: ["config"],
+          additionalProperties: false,
+        },
+        strict: false,
+      });
+    }
     /* Some additional tools, disabled as they seem to slow down model performance
       {
         type: "function",
@@ -354,6 +391,7 @@ export class Agent {
       console.log(`${name}(${JSON.stringify(args)})`);
     }
 
+    let _result: unknown = undefined;
     if (
       this.computer &&
       typeof (this.computer as unknown as Record<string, unknown>)[name] ===
@@ -362,7 +400,7 @@ export class Agent {
       const method = (this.computer as unknown as Record<string, unknown>)[
         name
       ] as (...args: unknown[]) => unknown;
-      await method.apply(this.computer, Object.values(args));
+      _result = await method.apply(this.computer, Object.values(args));
       
       // 🛡️ RECORD ACTION TO HISTORY (for StallGuard)
       if (this.sessionId) {
@@ -381,7 +419,7 @@ export class Agent {
     return {
       type: "function_call_output",
       call_id: functionItem.call_id,
-      output: "success", // hard-coded output for demo
+      output: (typeof _result === 'string') ? _result : JSON.stringify(_result ?? { status: 'success' }),
     };
   }
 }

@@ -169,6 +169,11 @@ export default function AuditLogsViewer({ agentId }: AuditLogsViewerProps) {
                         <div className="font-medium text-sm md:text-base text-white/90 leading-relaxed break-words">
                           {log.instruction}
                         </div>
+                        {log.extractedData && (
+                          <div className="text-xs md:text-sm text-green-300/90">
+                            Extracted {log.extractedData.totalCount} item{log.extractedData.totalCount === 1 ? '' : 's'} ({log.extractedData.dataType})
+                          </div>
+                        )}
                         
                         {log.reasoning && (
                           <div className="text-xs md:text-sm text-white/70 break-words">

@@ -5,6 +5,7 @@ import Browserbase from "@browserbasehq/sdk";
 import axios from "axios";
 import BrowserbaseContext from "@/lib/models/BrowserbaseContext";
 import connectDB from "@/lib/mongodb";
+import { PlaywrightExtractor, ExtractionResult } from "@/lib/services/playwright-extractor";
 
 dotenv.config();
 
@@ -741,5 +742,62 @@ export class BrowserbaseBrowser extends BasePlaywrightComputer {
       return null;
     }
     return `https://www.browserbase.com/sessions/${this.session.id}`;
+  }
+
+  /**
+   * Function tool implementation: extract_data
+   * Executes page data extraction using PlaywrightExtractor in either "structured" or "smart" mode.
+   * This method does not persist — persistence is handled by higher-level API flow.
+   */
+  async extract_data(params: {
+    config: {
+      mode: "structured" | "smart";
+      dataType: string;
+      selectors?: { container?: string; fields: Record<string, string> };
+      keywords?: string[];
+      maxRecords?: number;
+      validate?: boolean;
+      save?: boolean; // ignored here; persistence occurs in route handler
+    };
+  }): Promise<ExtractionResult & { validation?: { ok: boolean; reason?: string } }> {
+    if (!this._page) {
+      throw new Error("Page not initialized");
+    }
+
+    const { config } = params || ({} as any);
+    if (!config || !config.dataType || !config.mode) {
+      return {
+        dataType: config?.dataType || "unknown",
+        records: [],
+        totalCount: 0,
+        extractedAt: new Date(),
+        validation: { ok: false, reason: "Invalid config provided" },
+      };
+    }
+
+    const extractor = new PlaywrightExtractor(this._page);
+    let result: ExtractionResult;
+
+    if (config.mode === "structured" && config.selectors) {
+      result = await extractor.extractPageData({
+        dataType: config.dataType,
+        selectors: config.selectors,
+        maxRecords: config.maxRecords,
+      });
+    } else {
+      const keywords = Array.isArray(config.keywords) ? config.keywords : [];
+      result = await extractor.smartExtract(config.dataType, keywords);
+    }
+
+    // Optional validation (non-destructive)
+    let validation: { ok: boolean; reason?: string } | undefined;
+    if (config.validate) {
+      validation = {
+        ok: result.totalCount > 0,
+        reason: result.totalCount > 0 ? undefined : "No records extracted",
+      };
+    }
+
+    return { ...result, validation };
   }
 }

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import mongoose from 'mongoose';
-import { connectDB, Agent as AgentModel, AgentSession, SessionLog, DailyTask } from "../../../../../server/db";
+import { connectDB, Agent as AgentModel, AgentSession, SessionLog, DailyTask, ExtractedData } from "../../../../../server/db";
 import { Agent as CUAAgent } from "../../../cua/agent/agent";
 import { BrowserbaseBrowser } from "../../../cua/agent/browserbase";
 import { decryptCredentials } from "../../../../lib/encryption";
@@ -434,6 +434,9 @@ Start with the AUTHENTICATION (if specified), then systematically work through e
     // Run agent loop
     console.log(`\n🔄 Starting CUA execution loop (max ${maxActions} actions)\n`);
     
+    // Map function call_id -> { logId, name } to correlate outputs after execution
+    const functionCallLogMap = new Map<string, { logId: string; name: string }>();
+
     while (actionCount < maxActions) {
       actionCount++;
 
@@ -570,6 +573,7 @@ Start with the AUTHENTICATION (if specified), then systematically work through e
           const functionCall = item as unknown as {
             name: string;
             arguments: string;
+            call_id?: string;
           };
 
           // Parse and format function arguments
@@ -594,7 +598,7 @@ Start with the AUTHENTICATION (if specified), then systematically work through e
             agent.description || ''
           );
 
-          await SessionLog.create({
+          const createdLog = await SessionLog.create({
             userId,
             sessionId: sessionId,
             stepNumber: totalStepCount, // Use monotonic counter
@@ -603,6 +607,9 @@ Start with the AUTHENTICATION (if specified), then systematically work through e
             reasoning: functionReasoning,
             output: { name: functionCall.name, args: functionCall.arguments },
           });
+          if (functionCall.call_id && createdLog?._id) {
+            functionCallLogMap.set(functionCall.call_id, { logId: createdLog._id.toString(), name: functionCall.name });
+          }
         }
       }
 
@@ -642,6 +649,52 @@ Start with the AUTHENTICATION (if specified), then systematically work through e
           type: "message",
           content: `Action execution encountered an error: ${actionError instanceof Error ? actionError.message : 'Unknown error'}. Please try a different approach or skip this action if not critical.`
         }];
+      }
+
+      // Post-execution: persist extraction results and update logs
+      try {
+        for (const out of actionOutputs as any[]) {
+          if (out && out.type === 'function_call_output' && out.call_id) {
+            const mapping = functionCallLogMap.get(out.call_id);
+            if (mapping && mapping.name === 'extract_data') {
+              let parsed: any = null;
+              try { parsed = typeof out.output === 'string' ? JSON.parse(out.output) : out.output; } catch { parsed = null; }
+
+              if (parsed && parsed.dataType) {
+                try {
+                  const extractionDoc = await ExtractedData.create({
+                    userId,
+                    agentId: new mongoose.Types.ObjectId(agentId),
+                    sessionId: new mongoose.Types.ObjectId(sessionId),
+                    dataType: parsed.dataType,
+                    records: Array.isArray(parsed.records) ? parsed.records : [],
+                    totalCount: typeof parsed.totalCount === 'number' ? parsed.totalCount : (Array.isArray(parsed.records) ? parsed.records.length : 0),
+                    extractedAt: parsed.extractedAt ? new Date(parsed.extractedAt) : new Date(),
+                  });
+
+                  try {
+                    await SessionLog.findByIdAndUpdate(mapping.logId, {
+                      $set: {
+                        extractedData: {
+                          dataType: extractionDoc.dataType,
+                          records: (extractionDoc.records || []).slice(0, 5),
+                          totalCount: extractionDoc.totalCount,
+                          extractedAt: extractionDoc.extractedAt,
+                        },
+                      },
+                    });
+                  } catch (e) {
+                    console.warn('Failed to update SessionLog with extractedData:', e);
+                  }
+                } catch (e) {
+                  console.error('Failed to persist extraction result:', e);
+                }
+              }
+            }
+          }
+        }
+      } catch (persistErr) {
+        console.error('Error handling function outputs:', persistErr);
       }
 
       // Add outputs to messages for next iteration

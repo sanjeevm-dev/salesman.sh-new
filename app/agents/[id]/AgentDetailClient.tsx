@@ -30,6 +30,7 @@ import LivePreviewSplit, { LiveStep } from "../../components/LivePreviewSplit";
 import { SessionLog } from "../../utils/stepFormatter";
 import { useToast } from "../../contexts/ToastContext";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
+import ExtractionResultsViewer from "../../components/ExtractionResultsViewer";
 
 interface DailyTask {
   id: string;
@@ -43,7 +44,7 @@ interface DailyTask {
   completedAt?: string | null;
 }
 
-type TabType = "overview" | "livepreview" | "tasks" | "sessions" | "memory" | "audit";
+type TabType = "overview" | "livepreview" | "tasks" | "sessions" | "memory" | "audit" | "extractions";
 
 interface AgentDetailClientProps {
   agent: AgentWithRelations;
@@ -566,6 +567,7 @@ export default function AgentDetailClient({
               { id: "tasks", label: "Daily Tasks", icon: List },
               { id: "sessions", label: "Sessions", icon: Activity },
               { id: "memory", label: "Memory", icon: Brain },
+              { id: "extractions", label: "Extractions", icon: List },
               { id: "audit", label: "Audit Logs", icon: Clock },
             ].map((tab) => (
               <button
@@ -947,6 +949,16 @@ export default function AgentDetailClient({
                   </div>
                 ))
               )}
+            </motion.div>
+          )}
+
+          {activeTab === "extractions" && (
+            <motion.div
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="space-y-4"
+            >
+              <ExtractionResultsViewer agentId={agentId} />
             </motion.div>
           )}
 

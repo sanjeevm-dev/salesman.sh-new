@@ -1,0 +1,783 @@
+import { NextResponse } from "next/server";
+import { db } from "../../../../../server/db";
+import {
+  agents,
+  agentSessions,
+  sessionLogs,
+  dailyTasks,
+} from "../../../../../shared/schema";
+import { eq, and, desc, asc } from "drizzle-orm";
+import { Agent } from "../../../cua/agent/agent";
+import { BrowserbaseBrowser } from "../../../cua/agent/browserbase";
+import { decryptCredentials } from "../../../../lib/encryption";
+import type { Item } from "../../../cua/agent/types";
+import {
+  applyRateLimit,
+  agentExecutionRateLimiter,
+} from "@/app/lib/rate-limiter";
+import {
+  formatActionText,
+  formatToolBadge,
+} from "@/app/lib/action-formatter";
+
+// Allow up to 120 seconds for CUA agent execution (browser automation can take time)
+export const maxDuration = 120;
+
+interface AgentData {
+  id: number;
+  name: string;
+  systemPrompt: string;
+  targetWebsite?: string | null;
+  authCredentials?: unknown;
+  knowledgeBase?: string | null;
+  userExpectations?: string | null;
+  isDeployed: boolean | null;
+}
+
+interface Message {
+  role: "user" | "system" | "assistant" | "developer";
+  content: string;
+}
+
+// Helper function to substitute credential placeholders in execution prompts
+function substituteCredentials(
+  prompt: string,
+  credentials: Record<string, string>,
+): string {
+  let substitutedPrompt = prompt;
+
+  // Common credential placeholder patterns to substitute
+  const placeholderPatterns = [
+    { regex: /\{linkedin_email\}/gi, key: "linkedin_email" },
+    { regex: /\{linkedin_password\}/gi, key: "linkedin_password" },
+    { regex: /\{twitter_username\}/gi, key: "twitter_username" },
+    { regex: /\{twitter_password\}/gi, key: "twitter_password" },
+    { regex: /\{google_email\}/gi, key: "google_email" },
+    { regex: /\{google_password\}/gi, key: "google_password" },
+    { regex: /\{email\}/gi, key: "email" },
+    { regex: /\{password\}/gi, key: "password" },
+    { regex: /\{username\}/gi, key: "username" },
+  ];
+
+  // Track which credentials were actually needed
+  const missingCredentials: string[] = [];
+
+  for (const pattern of placeholderPatterns) {
+    if (substitutedPrompt.match(pattern.regex)) {
+      const credentialValue = credentials[pattern.key];
+      if (!credentialValue) {
+        missingCredentials.push(pattern.key);
+      } else {
+        substitutedPrompt = substitutedPrompt.replace(
+          pattern.regex,
+          credentialValue,
+        );
+      }
+    }
+  }
+
+  // If critical credentials are missing, throw error
+  if (missingCredentials.length > 0) {
+    throw new Error(
+      `Missing required credentials for execution: ${missingCredentials.join(", ")}. ` +
+        `The execution prompt requires these credentials but they were not provided.`,
+    );
+  }
+
+  return substitutedPrompt;
+}
+
+// Execute agent using pre-generated execution prompt
+async function executeWithExecutionPrompt(
+  agentId: number,
+  sessionId: number,
+  executionPrompt: string,
+  agent: AgentData,
+  dailyTaskId?: number,
+) {
+  let browser: BrowserbaseBrowser | null = null;
+
+  try {
+    // Initialize Browserbase browser with proxies and CAPTCHA solving enabled
+    browser = new BrowserbaseBrowser(1024, 768, "us-east-1", true);
+
+    console.log("🌐 Connecting to Browserbase session...");
+    await browser.connect();
+    console.log("✅ Browser connection initiated");
+
+    // CRITICAL: Verify browser is fully ready before proceeding
+    // Browserbase can take 30-60+ seconds to provision a session
+    const browserSessionId = (
+      browser as unknown as { session?: { id: string } }
+    ).session?.id;
+
+    if (!browserSessionId) {
+      throw new Error(
+        "Failed to establish Browserbase session - no session ID returned",
+      );
+    }
+
+    // Store browser session ID in database
+    await db
+      .update(agentSessions)
+      .set({ browserSessionId })
+      .where(eq(agentSessions.id, sessionId));
+
+    // Wait for browser to be fully ready by taking a test screenshot
+    console.log("⏳ Verifying browser readiness...");
+    const maxReadinessWait = 90000; // 90 seconds max wait (Browserbase can take 60+ seconds)
+    const readinessStart = Date.now();
+    let browserReady = false;
+    let retryDelay = 2000; // Start with 2 second delays
+
+    while (Date.now() - readinessStart < maxReadinessWait) {
+      try {
+        // Attempt a screenshot to verify browser is responsive
+        await browser.screenshot();
+        browserReady = true;
+        const elapsedSeconds = Math.floor((Date.now() - readinessStart) / 1000);
+        console.log(
+          `✅ Browser is ready and responsive (took ${elapsedSeconds}s)`,
+        );
+        break;
+      } catch {
+        // Browser not ready yet, wait and retry with progressive backoff
+        const elapsedSeconds = Math.floor((Date.now() - readinessStart) / 1000);
+        console.log(
+          `⏳ Browser not ready yet, waiting... (${elapsedSeconds}s elapsed)`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, retryDelay));
+
+        // Progressive backoff: increase delay after 30 seconds
+        if (elapsedSeconds > 30 && retryDelay < 5000) {
+          retryDelay = 5000; // Increase to 5 seconds after 30s
+          console.log("⏱️ Switching to 5-second check interval");
+        }
+      }
+    }
+
+    if (!browserReady) {
+      throw new Error(
+        "Browser failed to become ready within 90 seconds. Browserbase may be experiencing delays. Please try again.",
+      );
+    }
+
+    // Initialize CUA agent
+    const cuaAgent = new Agent("computer-use-preview", browser);
+
+    // Fetch previous day's outcomes for context (if this is a daily task)
+    let previousDaysContext = "";
+    if (dailyTaskId) {
+      const completedTasks = await db
+        .select()
+        .from(dailyTasks)
+        .where(
+          and(
+            eq(dailyTasks.agentId, agentId),
+            eq(dailyTasks.status, "completed"),
+          ),
+        )
+        .orderBy(asc(dailyTasks.dayNumber));
+
+      if (completedTasks.length > 0) {
+        previousDaysContext =
+          "\n\n📊 PREVIOUS DAYS OUTCOMES (use this context to inform today's actions):\n\n";
+        completedTasks.forEach((task) => {
+          previousDaysContext += `Day ${task.dayNumber} Results:\n`;
+          if (task.outcomes) {
+            const outcomes = task.outcomes as Record<string, unknown>;
+            previousDaysContext += `- Actions taken: ${(outcomes.actions as string[] | undefined)?.join(", ") || "N/A"}\n`;
+            previousDaysContext += `- URLs visited: ${(outcomes.urlsVisited as string[] | undefined)?.join(", ") || "N/A"}\n`;
+            previousDaysContext += `- Summary: ${(outcomes.summary as string) || "N/A"}\n`;
+          }
+          previousDaysContext += "\n";
+        });
+      }
+    }
+
+    // Decrypt credentials if they exist
+    let credentialsText = "No credentials provided";
+    let decryptedCreds: Record<string, string> = {};
+
+    const authCreds = agent.authCredentials as
+      | { customFields?: string | Record<string, string> }
+      | null
+      | undefined;
+    if (authCreds?.customFields) {
+      try {
+        const encryptedFields = authCreds.customFields;
+        if (typeof encryptedFields === "string") {
+          decryptedCreds = decryptCredentials(encryptedFields);
+          credentialsText = Object.entries(decryptedCreds)
+            .map(([key, value]) => `${key}: ${value}`)
+            .join("\n");
+        } else {
+          decryptedCreds = encryptedFields as Record<string, string>;
+          credentialsText = Object.entries(encryptedFields)
+            .map(([key, value]) => `${key}: ${value}`)
+            .join("\n");
+        }
+      } catch {
+        console.error("Error decrypting credentials");
+        throw new Error(
+          "Failed to decrypt authentication credentials. Please check your credentials and try again.",
+        );
+      }
+    }
+
+    // Substitute credential placeholders in execution prompt
+    let substitutedPrompt = executionPrompt;
+    try {
+      substitutedPrompt = substituteCredentials(
+        executionPrompt,
+        decryptedCreds,
+      );
+      console.log(
+        "✅ Credentials substituted successfully in execution prompt",
+      );
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message.includes("Missing required credentials")
+      ) {
+        // Re-throw credential errors immediately - these are fatal
+        console.error("❌ Credential substitution failed:", error.message);
+        throw error;
+      }
+      // If no placeholders found, that's fine - continue with original prompt
+      console.log("ℹ️ No credential placeholders found in prompt");
+    }
+
+    // Set up messages with substituted execution prompt and previous days' context
+    const messages: Message[] = [
+      {
+        role: "developer",
+        content: `${substitutedPrompt}\n\nAVAILABLE CREDENTIALS:\n${credentialsText}${previousDaysContext}`,
+      },
+      {
+        role: "user",
+        content: `Begin autonomous execution now.
+
+⚠️ CRITICAL INSTRUCTIONS:
+- You MUST complete EVERY item in the WORKFLOW section above
+- Do NOT stop after completing just one step
+- Continue executing until ALL workflow items (1, 2, 3, 4, 5...) are finished
+- Only stop when you have achieved ALL the success criteria listed
+- If you encounter errors, retry or find workarounds - do not give up early
+
+Start with the AUTHENTICATION (if specified), then systematically work through each WORKFLOW item until the entire task is complete.`,
+      },
+    ];
+
+    // 1️⃣ LOG FINAL PROMPT SENT TO CUA
+    console.log('\n' + '='.repeat(80));
+    console.log('🚀 FINAL PROMPT SENT TO CUA AGENT');
+    console.log('='.repeat(80));
+    console.log('\n📋 DEVELOPER MESSAGE (System Prompt):');
+    console.log(messages[0].content);
+    console.log('\n👤 USER MESSAGE (Execution Trigger):');
+    console.log(messages[1].content);
+    console.log('\n' + '='.repeat(80) + '\n');
+
+    let stepCount = 0;
+    const maxSteps = 100; // Increased for complex multi-step workflows
+    let previousResponseId: string | undefined = undefined;
+    const performanceMetrics = {
+      aiCallTimes: [] as number[],
+      actionExecutionTimes: [] as number[],
+      totalStartTime: Date.now(),
+    };
+
+    // Run agent loop
+    console.log(`\n🔄 Starting CUA execution loop (max ${maxSteps} steps)\n`);
+    
+    while (stepCount < maxSteps) {
+      stepCount++;
+
+      // 2️⃣ LOG STEP COUNT
+      console.log(`\n📍 STEP ${stepCount}/${maxSteps} - Starting...`);
+
+      // Check if agent has been paused
+      const [currentAgent] = await db
+        .select()
+        .from(agents)
+        .where(eq(agents.id, agentId));
+
+      if (!currentAgent || !currentAgent.isDeployed) {
+        console.log(`\n❌ STOP REASON: Agent paused by user at step ${stepCount}`);
+        console.log(`   isDeployed = ${currentAgent?.isDeployed || 'agent not found'}\n`);
+        break;
+      }
+
+      // Get action from AI (track performance)
+      const aiStartTime = Date.now();
+      const response = await cuaAgent.getAction(messages, previousResponseId);
+      const aiDuration = Date.now() - aiStartTime;
+      performanceMetrics.aiCallTimes.push(aiDuration);
+
+      // 3️⃣ LOG CUA RESPONSE DETAILS
+      console.log(`   ⏱️  AI call took ${aiDuration}ms`);
+      console.log(`   📤 Response ID: ${response?.responseId || 'none'}`);
+      console.log(`   🔧 Output items: ${response?.output?.length || 0}`);
+
+      if (!response || !response.output || response.output.length === 0) {
+        // Task completed or no actions to take
+        console.log(`\n✅ STOP REASON: CUA returned empty output at step ${stepCount}`);
+        console.log(`   This means the AI has decided the task is complete.`);
+        console.log(`   Response exists: ${!!response}`);
+        console.log(`   Output exists: ${!!response?.output}`);
+        console.log(`   Output length: ${response?.output?.length || 0}\n`);
+        break;
+      }
+
+      // Store responseId for next iteration
+      previousResponseId = response.responseId;
+
+      // Execute the actions and get outputs (track performance)
+      const actionStartTime = Date.now();
+      
+      // 4️⃣ LOG ACTIONS BEING EXECUTED
+      console.log(`   🎬 Executing ${response.output.length} action(s)...`);
+      response.output.forEach((item: Item, idx: number) => {
+        const itemType = item.type;
+        if (itemType === 'computer_call') {
+          const computerCall = item as unknown as { action?: { type?: string } };
+          console.log(`      ${idx + 1}. ${computerCall.action?.type || 'unknown'}`);
+        } else if (itemType === 'function_call') {
+          const funcCall = item as unknown as { name?: string };
+          console.log(`      ${idx + 1}. Function: ${funcCall.name || 'unknown'}`);
+        }
+      });
+      
+      const actionOutputs = await cuaAgent.takeAction(response.output);
+      const actionDuration = Date.now() - actionStartTime;
+      performanceMetrics.actionExecutionTimes.push(actionDuration);
+      
+      console.log(`   ✅ Actions executed in ${actionDuration}ms`);
+
+      // Add outputs to messages for next iteration
+      messages.push(...(actionOutputs as unknown as Message[]));
+
+      // Log the action details with user-friendly formatting
+      for (const item of response.output) {
+        const itemType = (item as Item).type;
+
+        if (itemType === "computer_call") {
+          const computerCall = item as unknown as {
+            action: {
+              type: string;
+              [key: string]: unknown;
+            };
+          };
+
+          // Extract the tool type from action.type (not action.tool)
+          const rawTool = computerCall.action?.type || "";
+
+          // Format the action into user-friendly text
+          const formattedText = formatActionText(computerCall.action);
+          const formattedTool = formatToolBadge(rawTool);
+          const formattedReasoning = '';
+
+          await db.insert(sessionLogs).values({
+            sessionId: sessionId,
+            stepNumber: stepCount,
+            tool: formattedTool,
+            instruction: formattedText, // User-friendly text instead of JSON
+            reasoning: formattedReasoning || null,
+            output: computerCall.action, // Keep raw data for debugging
+          });
+        }
+
+        if (itemType === "function_call") {
+          const functionCall = item as unknown as {
+            name: string;
+            arguments: string;
+          };
+
+          // Parse and format function arguments
+          let formattedArgs = functionCall.arguments;
+          try {
+            const args = JSON.parse(functionCall.arguments);
+            // Create user-friendly description based on function name
+            if (functionCall.name === "goto") {
+              formattedArgs = `Navigating to ${args.url || "webpage"}`;
+            } else {
+              formattedArgs = `Executing ${functionCall.name} with parameters`;
+            }
+          } catch {
+            formattedArgs = `Executing ${functionCall.name}`;
+          }
+
+          await db.insert(sessionLogs).values({
+            sessionId: sessionId,
+            stepNumber: stepCount,
+            tool: formatToolBadge(functionCall.name),
+            instruction: formattedArgs,
+            reasoning: null,
+            output: { name: functionCall.name, args: functionCall.arguments },
+          });
+        }
+      }
+    }
+
+    // 5️⃣ LOG FINAL EXECUTION SUMMARY
+    console.log('\n' + '='.repeat(80));
+    console.log('🏁 CUA EXECUTION LOOP ENDED');
+    console.log('='.repeat(80));
+    console.log(`📊 Total steps executed: ${stepCount}/${maxSteps}`);
+    
+    if (stepCount >= maxSteps) {
+      console.log(`⚠️  Reason: Reached maximum step limit (${maxSteps} steps)`);
+    } else if (stepCount === 0) {
+      console.log(`⚠️  Reason: No steps executed - check if agent was immediately paused`);
+    } else {
+      console.log(`✅ Reason: CUA completed task or returned empty output`);
+    }
+    console.log('='.repeat(80) + '\n');
+
+    // Calculate and log performance metrics
+    const totalDuration = Date.now() - performanceMetrics.totalStartTime;
+    const avgAiCallTime =
+      performanceMetrics.aiCallTimes.length > 0
+        ? performanceMetrics.aiCallTimes.reduce((a, b) => a + b, 0) /
+          performanceMetrics.aiCallTimes.length
+        : 0;
+    const avgActionTime =
+      performanceMetrics.actionExecutionTimes.length > 0
+        ? performanceMetrics.actionExecutionTimes.reduce((a, b) => a + b, 0) /
+          performanceMetrics.actionExecutionTimes.length
+        : 0;
+
+    console.log("📊 PERFORMANCE METRICS:");
+    console.log(
+      `  Total execution time: ${(totalDuration / 1000).toFixed(2)}s`,
+    );
+    console.log(`  Total steps: ${stepCount}`);
+    console.log(`  Avg AI call time: ${(avgAiCallTime / 1000).toFixed(2)}s`);
+    console.log(
+      `  Avg action execution time: ${(avgActionTime / 1000).toFixed(2)}s`,
+    );
+    console.log(
+      `  Steps per second: ${(stepCount / (totalDuration / 1000)).toFixed(2)}`,
+    );
+
+    // Mark session as completed
+    await db
+      .update(agentSessions)
+      .set({
+        status: "completed",
+        completedAt: new Date(),
+        totalSteps: stepCount,
+        summary: `Autonomous execution completed successfully (${stepCount} steps in ${(totalDuration / 1000).toFixed(1)}s)`,
+      })
+      .where(eq(agentSessions.id, sessionId));
+
+    // Update daily task if this was a daily task execution
+    if (dailyTaskId) {
+      // Extract detailed outcomes from session logs
+      const logs = await db
+        .select()
+        .from(sessionLogs)
+        .where(eq(sessionLogs.sessionId, sessionId))
+        .orderBy(sessionLogs.stepNumber);
+
+      // Parse outcomes from execution logs
+      const urls: string[] = [];
+      const actions: string[] = [];
+
+      logs.forEach((log) => {
+        if (log.instruction) {
+          actions.push(log.instruction);
+
+          // Extract URLs from navigation actions
+          if (log.instruction.toLowerCase().includes("navigating to")) {
+            const urlMatch = log.instruction.match(
+              /(?:https?:\/\/)?(?:www\.)?([^\s]+)/,
+            );
+            if (urlMatch) urls.push(urlMatch[0]);
+          }
+        }
+      });
+
+      const outcomes = {
+        totalSteps: stepCount,
+        completedAt: new Date().toISOString(),
+        summary: `Completed with ${stepCount} actions`,
+        actions: actions.slice(0, 10), // Store first 10 actions for context
+        urlsVisited: [...new Set(urls)], // Unique URLs
+        executionTime: new Date().toISOString(),
+      };
+
+      await db
+        .update(dailyTasks)
+        .set({
+          status: "completed",
+          completedAt: new Date(),
+          outcomes: outcomes,
+        })
+        .where(eq(dailyTasks.id, dailyTaskId));
+
+      console.log(`✅ Day task ${dailyTaskId} completed with outcomes:`, {
+        totalSteps: stepCount,
+        actionsCount: actions.length,
+        urlsCount: urls.length,
+      });
+    }
+
+    return { success: true };
+  } catch (error) {
+    console.error("Error during autonomous execution:", error);
+
+    // Determine user-friendly error message
+    let errorMessage = "Unknown error occurred";
+    if (error instanceof Error) {
+      errorMessage = error.message;
+
+      // Check for specific error types
+      if (
+        error.message.includes("402") ||
+        error.message.includes("Free plan browser minutes limit")
+      ) {
+        errorMessage =
+          "402 Free plan browser minutes limit reached. Please upgrade your account at https://browserbase.com/plans";
+      } else if (error.message.includes("ERR_ABORTED")) {
+        errorMessage =
+          "Navigation error: Page navigation was aborted. This can happen when multiple navigation requests conflict. The system will retry automatically.";
+      } else if (
+        error.message.includes("400") ||
+        error.message.includes("No tool output found")
+      ) {
+        errorMessage =
+          "Browser automation error: Tool execution failed. This may be due to temporary API issues. Please try again.";
+      } else if (error.message.includes("rate limit")) {
+        errorMessage =
+          "Rate limit exceeded. Please wait a moment before trying again.";
+      }
+    }
+
+    // Mark session as failed
+    await db
+      .update(agentSessions)
+      .set({
+        status: "failed",
+        errorMessage: errorMessage,
+        completedAt: new Date(),
+      })
+      .where(eq(agentSessions.id, sessionId));
+
+    // Update daily task if this was a daily task execution
+    // Set to 'pending' instead of 'failed' so it can be re-run
+    if (dailyTaskId) {
+      await db
+        .update(dailyTasks)
+        .set({
+          status: "pending",
+          error: errorMessage,
+        })
+        .where(eq(dailyTasks.id, dailyTaskId));
+
+      console.log(
+        `⚠️ Day task ${dailyTaskId} stopped/failed - status reset to pending for retry: ${errorMessage}`,
+      );
+    }
+
+    // Stop the Browserbase session
+    if (browser) {
+      try {
+        await browser.disconnect();
+        browser = null; // Prevent double cleanup in finally block
+      } catch (err) {
+        console.error("Error stopping browser session:", err);
+      }
+    }
+
+    return { success: false, error: errorMessage };
+  } finally {
+    // Clean up browser if not already cleaned up
+    if (browser) {
+      try {
+        await browser.disconnect();
+      } catch (err) {
+        console.error("Error disconnecting browser:", err);
+      }
+    }
+  }
+}
+
+// POST /api/agents/[id]/deploy - Deploy an agent (execute using pre-generated executionPrompt)
+export async function POST(
+  request: Request,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  const rateLimit = await applyRateLimit(request, agentExecutionRateLimiter);
+  if (!rateLimit.allowed) {
+    return NextResponse.json(
+      { error: "Too many requests. Please try again later." },
+      {
+        status: 429,
+        headers: rateLimit.headers,
+      },
+    );
+  }
+
+  try {
+    const { id } = await params;
+    const agentId = parseInt(id);
+
+    if (isNaN(agentId)) {
+      return NextResponse.json(
+        { error: "Invalid agent ID" },
+        { status: 400, headers: rateLimit.headers },
+      );
+    }
+
+    // Get agent
+    const [agent] = await db
+      .select()
+      .from(agents)
+      .where(eq(agents.id, agentId));
+
+    if (!agent) {
+      return NextResponse.json(
+        { error: "Agent not found" },
+        { status: 404, headers: rateLimit.headers },
+      );
+    }
+
+    // Check for daily tasks first (multi-day campaign mode)
+    const nextPendingTask = await db
+      .select()
+      .from(dailyTasks)
+      .where(
+        and(eq(dailyTasks.agentId, agentId), eq(dailyTasks.status, "pending")),
+      )
+      .orderBy(asc(dailyTasks.dayNumber))
+      .limit(1);
+
+    let executionPrompt = agent.executionPrompt;
+    let currentDailyTaskId: number | undefined;
+    console.log(`@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@ ${executionPrompt}`);
+
+    if (nextPendingTask.length > 0) {
+      // Use daily task prompt for multi-day campaigns
+      const task = nextPendingTask[0];
+      executionPrompt = task.taskPrompt;
+      currentDailyTaskId = task.id;
+      console.log(`$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$ ${task.taskPrompt}`);
+
+      console.log(`🎯 Executing Day ${task.dayNumber} task (ID: ${task.id})`);
+
+      console.log(`################################# ${executionPrompt}`);
+      // Update task status to running
+      await db
+        .update(dailyTasks)
+        .set({ status: "running" })
+        .where(eq(dailyTasks.id, task.id));
+    } else if (!agent.executionPrompt) {
+      // No daily tasks and no executionPrompt - cannot execute
+      return NextResponse.json(
+        {
+          error:
+            "Agent does not have an execution plan. Please recreate the agent.",
+        },
+        { status: 400, headers: rateLimit.headers },
+      );
+    }
+
+    // Set isDeployed to true BEFORE starting execution to prevent race condition
+    const [deployedAgent] = await db
+      .update(agents)
+      .set({
+        isDeployed: true,
+        updatedAt: new Date(),
+      })
+      .where(eq(agents.id, agentId))
+      .returning();
+
+    // Create a new session
+    const [session] = await db
+      .insert(agentSessions)
+      .values({
+        agentId: agentId,
+        status: "running",
+        startedAt: new Date(),
+      })
+      .returning();
+
+    // Start autonomous execution in background using executionPrompt
+    let sessionInfo = null;
+    try {
+      // Start execution in the background (don't await, but capture promise)
+      const executionPromise = executeWithExecutionPrompt(
+        agentId,
+        session.id,
+        executionPrompt!,
+        agent,
+        currentDailyTaskId,
+      );
+
+      // Poll for the session with browserSessionId to appear
+      // Wait up to 90 seconds for the browser session to start (browserbase can take 60+ seconds)
+      const maxWaitTime = 90000; // 90 seconds
+      const pollInterval = 500; // Check every 500ms
+      const startTime = Date.now();
+
+      while (Date.now() - startTime < maxWaitTime) {
+        const [runningSession] = await db
+          .select()
+          .from(agentSessions)
+          .where(
+            and(
+              eq(agentSessions.agentId, agentId),
+              eq(agentSessions.status, "running"),
+            ),
+          )
+          .orderBy(desc(agentSessions.id))
+          .limit(1);
+
+        if (runningSession && runningSession.browserSessionId) {
+          sessionInfo = runningSession;
+          console.log(
+            "Session with browserSessionId found:",
+            runningSession.browserSessionId,
+          );
+          break;
+        }
+
+        // Wait before next poll
+        await new Promise((resolve) => setTimeout(resolve, pollInterval));
+      }
+
+      // Let execution continue in background
+      executionPromise.catch((error) => {
+        console.error("Background execution error:", error);
+      });
+
+      console.log("Session info after polling:", sessionInfo);
+    } catch (error) {
+      console.error("Error starting execution:", error);
+      // If execution fails, rollback isDeployed
+      await db
+        .update(agents)
+        .set({ isDeployed: false })
+        .where(eq(agents.id, agentId));
+    }
+
+    return NextResponse.json(
+      {
+        success: true,
+        agent: deployedAgent,
+        session: sessionInfo,
+        message:
+          "Agent deployed successfully! Autonomous execution has started.",
+      },
+      { status: 200, headers: rateLimit.headers },
+    );
+  } catch (error) {
+    console.error("Error deploying agent:", error);
+    return NextResponse.json(
+      { error: "Failed to deploy agent" },
+      { status: 500, headers: rateLimit.headers },
+    );
+  }
+}
